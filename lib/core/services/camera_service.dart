@@ -52,6 +52,7 @@ class CameraService {
     ResolutionPreset resolution = ResolutionPreset.medium,
     bool enableAudio = false,
     bool forceRefresh = false,
+    ImageFormatGroup? imageFormatGroup,
   }) async {
     if (isRunningInTest) return null;
     try {
@@ -74,12 +75,27 @@ class CameraService {
         ),
       );
 
+      ImageFormatGroup? resolvedFormat = imageFormatGroup;
+      if (resolvedFormat == null && !kIsWeb) {
+        try {
+          if (Platform.isAndroid) {
+            resolvedFormat = ImageFormatGroup.nv21;
+          } else if (Platform.isIOS) {
+            resolvedFormat = ImageFormatGroup.bgra8888;
+          } else {
+            resolvedFormat = ImageFormatGroup.jpeg;
+          }
+        } catch (_) {
+          resolvedFormat = ImageFormatGroup.jpeg;
+        }
+      }
+
       final controller = CameraController(
         selected,
         resolution,
         enableAudio: enableAudio,
         // camera_web on Chrome does not support custom imageFormatGroup (throws PlatformException)
-        imageFormatGroup: kIsWeb ? null : ImageFormatGroup.jpeg,
+        imageFormatGroup: kIsWeb ? null : resolvedFormat,
       );
 
       await controller.initialize();

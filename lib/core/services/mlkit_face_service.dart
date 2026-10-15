@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:math' as math;
+import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
@@ -60,7 +61,9 @@ class MLKitFaceService {
   MLKitFaceService._internal();
 
   FaceDetector? _detector;
+  FaceDetector? _fastDetector;
 
+  /// Accurate face detector for still image cropping & biometric template generation
   FaceDetector get _faceDetector {
     _detector ??= FaceDetector(
       options: FaceDetectorOptions(
@@ -73,6 +76,77 @@ class MLKitFaceService {
       ),
     );
     return _detector!;
+  }
+
+  /// Fast face detector optimized for real-time video stream liveness & blink detection
+  FaceDetector get fastFaceDetector {
+    _fastDetector ??= FaceDetector(
+      options: FaceDetectorOptions(
+        performanceMode: FaceDetectorMode.fast, // Use fast mode for real-time video stream
+        enableClassification: true,            // Required for eye open/close probabilities
+        enableLandmarks: true,
+        minFaceSize: 0.15,
+      ),
+    );
+    return _fastDetector!;
+  }
+
+  /// Convert a real-time CameraImage frame into ML Kit InputImage
+  InputImage? createInputImageFromCamera({
+    required CameraImage cameraImage,
+    required CameraDescription cameraDescription,
+  }) {
+    if (kIsWeb || isRunningInTest) return null;
+    try {
+      final sensorOrientation = cameraDescription.sensorOrientation;
+      final rotation = InputImageRotationValue.fromRawValue(sensorOrientation) ??
+          InputImageRotation.rotation0deg;
+      final format = InputImageFormatValue.fromRawValue(cameraImage.format.raw) ??
+          InputImageFormat.nv21;
+
+      if (cameraImage.planes.isEmpty) return null;
+
+      final WriteBuffer allBytes = WriteBuffer();
+      for (final Plane plane in cameraImage.planes) {
+        allBytes.putUint8List(plane.bytes);
+      }
+      final bytes = allBytes.done().buffer.asUint8List();
+
+      return InputImage.fromBytes(
+        bytes: bytes,
+        metadata: InputImageMetadata(
+          size: Size(
+            cameraImage.width.toDouble(),
+            cameraImage.height.toDouble(),
+          ),
+          rotation: rotation,
+          format: format,
+          bytesPerRow: cameraImage.planes[0].bytesPerRow,
+        ),
+      );
+    } catch (e) {
+      debugPrint('[MLKitFaceService] Error converting CameraImage: $e');
+      return null;
+    }
+  }
+
+  /// Process a camera frame in real-time with the fast face detector
+  Future<List<Face>> processLiveCameraImage({
+    required CameraImage cameraImage,
+    required CameraDescription cameraDescription,
+  }) async {
+    if (kIsWeb || isRunningInTest) return [];
+    final inputImage = createInputImageFromCamera(
+      cameraImage: cameraImage,
+      cameraDescription: cameraDescription,
+    );
+    if (inputImage == null) return [];
+    try {
+      return await fastFaceDetector.processImage(inputImage);
+    } catch (e) {
+      debugPrint('[MLKitFaceService] Live frame detection error: $e');
+      return [];
+    }
   }
 
   bool get isRunningInTest {
@@ -519,5 +593,7 @@ class MLKitFaceService {
   void dispose() {
     _detector?.close();
     _detector = null;
+    _fastDetector?.close();
+    _fastDetector = null;
   }
 }

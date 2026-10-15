@@ -13,8 +13,10 @@ import '../../../core/services/firestore_service.dart';
 import '../../../core/services/geofence_service.dart';
 import '../../../core/utils/image_crop_utils.dart';
 import '../../../core/services/ai_face_recognition_service.dart';
+import '../../../core/services/mlkit_face_service.dart';
 import '../../../core/theme/app_colors.dart';
 import '../../../core/theme/app_typography.dart';
+import 'widgets/liveness_camera_overlay.dart';
 
 /// Available verification modes for faculty campus check-in
 enum VerificationMode {
@@ -67,6 +69,14 @@ class _FacialVerificationScreenState extends State<FacialVerificationScreen>
   bool _isFrontCamera = true;
   bool _isAnalyzing = false;
   bool _isVerified = false;
+
+  // Real-time Anti-Proxy Liveness Detection state
+  final GlobalKey<LivenessCameraOverlayState> _livenessOverlayKey =
+      GlobalKey<LivenessCameraOverlayState>();
+  bool _isStreamingImages = false;
+  bool _isProcessingLiveFrame = false;
+  DateTime? _lastLiveFrameProcessedTime;
+  bool _isLivenessPassed = false;
 
   // Status message in viewfinder
   String _statusInstruction = 'Align eyes with the guide';
@@ -184,6 +194,7 @@ class _FacialVerificationScreenState extends State<FacialVerificationScreen>
         if (userInitiated) {
           _showFeedback('Camera stream active', Icons.videocam);
         }
+        _startLiveLivenessStream();
       } else {
         setState(() {
           _isCameraInitialized = false;
@@ -205,8 +216,88 @@ class _FacialVerificationScreenState extends State<FacialVerificationScreen>
     }
   }
 
+  /// Start real-time image frame analysis for Google ML Kit liveness & blink detection
+  Future<void> _startLiveLivenessStream() async {
+    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
+    if (_isStreamingImages || kIsWeb || CameraService().isRunningInTest) return;
+
+    try {
+      _isStreamingImages = true;
+      final cameraDesc = _cameraController!.description;
+
+      await _cameraController!.startImageStream((CameraImage image) async {
+        if (!mounted || _isProcessingLiveFrame || _isAnalyzing || _isVerified) return;
+
+        // Rate-limit analysis to ~10-12 fps (90ms interval) to keep UI responsive
+        final now = DateTime.now();
+        if (_lastLiveFrameProcessedTime != null &&
+            now.difference(_lastLiveFrameProcessedTime!).inMilliseconds < 90) {
+          return;
+        }
+        _lastLiveFrameProcessedTime = now;
+        _isProcessingLiveFrame = true;
+
+        try {
+          final faces = await MLKitFaceService().processLiveCameraImage(
+            cameraImage: image,
+            cameraDescription: cameraDesc,
+          );
+          if (!mounted) return;
+          if (faces.isNotEmpty) {
+            _livenessOverlayKey.currentState?.processCameraFace(faces.first);
+          }
+        } catch (e) {
+          debugPrint('[FacialVerification] Live frame analysis notice: $e');
+        } finally {
+          _isProcessingLiveFrame = false;
+        }
+      });
+    } catch (e) {
+      debugPrint('[FacialVerification] startImageStream notice: $e');
+      _isStreamingImages = false;
+    }
+  }
+
+  /// Pause or stop image frame stream so camera hardware is free to take full-resolution photos
+  Future<void> _stopLiveLivenessStream() async {
+    if (_cameraController != null && _isStreamingImages) {
+      try {
+        _isStreamingImages = false;
+        await _cameraController!.stopImageStream();
+      } catch (e) {
+        debugPrint('[FacialVerification] stopImageStream notice: $e');
+      }
+    }
+  }
+
+  /// Callback when Google ML Kit confirms an active living human blink cycle
+  void _onLivenessPassed() async {
+    if (_isAnalyzing || _isVerified) return;
+    setState(() {
+      _isLivenessPassed = true;
+      _statusInstruction = 'Liveness Confirmed • Capturing...';
+    });
+    _showFeedback('Liveness Confirmed: Human blink detected', Icons.verified);
+
+    // Stop real-time streaming before taking picture
+    await _stopLiveLivenessStream();
+
+    // Automatically trigger biometric photo capture and comparison
+    _triggerCapture();
+  }
+
+  /// Reset liveness detector state machine and resume stream
+  void _resetLiveness() {
+    setState(() {
+      _isLivenessPassed = false;
+    });
+    _livenessOverlayKey.currentState?.reset();
+    _startLiveLivenessStream();
+  }
+
   @override
   void dispose() {
+    _stopLiveLivenessStream();
     _cameraController?.dispose();
     _scanController.dispose();
     _shutterPulseController.dispose();
@@ -270,9 +361,11 @@ class _FacialVerificationScreenState extends State<FacialVerificationScreen>
     );
 
     if (_cameraController != null) {
+      await _stopLiveLivenessStream();
       await _cameraController?.dispose();
       _cameraController = null;
       _isCameraInitialized = false;
+      _livenessOverlayKey.currentState?.reset();
       await _initCameraHardware(userInitiated: true);
     }
   }
@@ -284,6 +377,9 @@ class _FacialVerificationScreenState extends State<FacialVerificationScreen>
     _shutterPulseController.forward().then((_) {
       if (mounted) _shutterPulseController.reverse();
     });
+
+    // Ensure live stream is paused so sensor can capture full-resolution image
+    await _stopLiveLivenessStream();
 
     setState(() {
       _isAnalyzing = true;
@@ -429,7 +525,9 @@ class _FacialVerificationScreenState extends State<FacialVerificationScreen>
           inTime: '08:45 AM',
           outTime: _formattedTime,
           totalHours: '8h 15m',
-          statusLabel: 'Biometric Verified (${matchResult.confidencePercentage})',
+          statusLabel: _isLivenessPassed
+              ? 'Liveness & Biometric Verified (${matchResult.confidencePercentage})'
+              : 'Biometric Verified (${matchResult.confidencePercentage})',
           gateTurnstile: 'LT-04 Hall • Facial Recognition Terminal',
           sessionSubtitle: 'Biometric AI Ingress Verification',
           isRegular: true,
@@ -1652,58 +1750,101 @@ class _FacialVerificationScreenState extends State<FacialVerificationScreen>
                   ),
                 ),
 
-                // Dynamic Instruction/Feedback Pill at bottom of viewfinder
+                // Live Eye Alignment Guide Pill
                 Positioned(
-                  bottom: 16,
-                  left: 20,
-                  right: 20,
-                  child: Center(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 6,
+                  top: 14,
+                  left: 18,
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withValues(alpha: 0.65),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.15),
                       ),
-                      decoration: BoxDecoration(
-                        color: _isVerified
-                            ? const Color(0xFF047857).withValues(alpha: 0.9)
-                            : AppColors.primary.withValues(alpha: 0.75),
-                        borderRadius: BorderRadius.circular(20),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.25),
-                            blurRadius: 8,
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.center_focus_strong,
+                          size: 11,
+                          color: Color(0xFF6EE7B7),
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          'Align eyes with the guide',
+                          style: AppTypography.codeSm.copyWith(
+                            color: Colors.white70,
+                            fontSize: 10,
+                            fontWeight: FontWeight.w500,
                           ),
-                        ],
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Container(
-                            width: 6,
-                            height: 6,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: _isVerified
-                                  ? Colors.white
-                                  : AppColors.secondaryFixed,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Flexible(
-                            child: Text(
-                              _statusInstruction,
-                              style: AppTypography.labelSm.copyWith(
-                                color: AppColors.onPrimary,
-                                fontWeight: FontWeight.w600,
-                              ),
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                        ],
-                      ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
+
+                // Liveness Camera Overlay / Verification Feedback Pill
+                if (_isVerified || _isAnalyzing || _capturedPhotoBytes != null)
+                  Positioned(
+                    bottom: 16,
+                    left: 20,
+                    right: 20,
+                    child: Center(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: _isVerified
+                              ? const Color(0xFF047857).withValues(alpha: 0.9)
+                              : AppColors.primary.withValues(alpha: 0.75),
+                          borderRadius: BorderRadius.circular(20),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.25),
+                              blurRadius: 8,
+                            ),
+                          ],
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              width: 6,
+                              height: 6,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: _isVerified
+                                    ? Colors.white
+                                    : AppColors.secondaryFixed,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Flexible(
+                              child: Text(
+                                _statusInstruction,
+                                style: AppTypography.labelSm.copyWith(
+                                  color: AppColors.onPrimary,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  )
+                else
+                  LivenessCameraOverlay(
+                    key: _livenessOverlayKey,
+                    onLivenessPassed: _onLivenessPassed,
+                    bottomOffset: 16,
+                  ),
               ],
             ),
           ),
@@ -1811,6 +1952,24 @@ class _FacialVerificationScreenState extends State<FacialVerificationScreen>
               ],
             ),
           ),
+          if (_isLivenessPassed) ...[
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const Icon(Icons.shield_outlined, size: 14, color: Color(0xFF047857)),
+                const SizedBox(width: 6),
+                Text(
+                  'Anti-Proxy Shield: Eye Blink Confirmed',
+                  style: AppTypography.codeSm.copyWith(
+                    color: const Color(0xFF047857),
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+          ],
         ],
       ),
     );
@@ -1887,7 +2046,7 @@ class _FacialVerificationScreenState extends State<FacialVerificationScreen>
                 ),
                 const SizedBox(height: 2),
                 Text(
-                  'Gallery upload strictly disabled. Capture live photo in uniform lighting.',
+                  'Anti-Proxy Liveness: Real-time blink verification active. Static photos, paper prints, and screen replays are automatically blocked.',
                   style: AppTypography.bodySm.copyWith(
                     color: AppColors.onErrorContainer,
                     fontSize: 12,
@@ -2473,6 +2632,7 @@ class _FacialVerificationScreenState extends State<FacialVerificationScreen>
                   _capturedPhotoBytes = null;
                   _statusInstruction = 'Align eyes with the guide';
                 });
+                _resetLiveness();
               },
               icon: const Icon(Icons.refresh, size: 16),
               label: const Text('Retake Biometric Verification'),
