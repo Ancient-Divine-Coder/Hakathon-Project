@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "940468581639",
+    "project_id": "college-5efe7",
+    "storage_bucket": "college-5efe7.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:940468581639:android:cf2e30163d0feeb73b01a2",
+        "android_client_info": {
+          "package_name": "com.campus.erp.campus_erp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB_qDl7PVvbAPFepcF1_gp4PKF1ER8RyLA"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
